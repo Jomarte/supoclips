@@ -1,0 +1,135 @@
+From b7e13b3392f6275de0f1e5f7d3dbe88c74404be0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 19 Nov 2026 01:03:45 +0000
+Subject: [PATCH] Improve clip hooks and clean endings
+
+---
+ backend/src/ai.py                        |  5 ++-
+ backend/src/services/video_service.py    | 50 +++++++++++++++++++++++-
+ backend/tests/unit/test_clip_openings.py | 15 +++++++
+ 3 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/backend/src/ai.py b/backend/src/ai.py
+index f3f851b..6dcf7fe 100644
+--- a/backend/src/ai.py
++++ b/backend/src/ai.py
+@@ -295,7 +295,7 @@ OUTPUT CONTRACT:
+ CORE OBJECTIVES:
+ 1. Identify segments that would be compelling on social media platforms
+ 2. Focus on complete thoughts, insights, or entertaining moments
+-3. Prioritize content with hooks, emotional moments, or valuable information
++3. Prioritize an immediate spoken hook with a satisfying payoff and a clean ending. A hook title cannot rescue several seconds of weak opening dialogue
+ 4. Each segment should be engaging and worth watching
+ 5. Score each segment's viral potential with detailed breakdown
+ 
+@@ -869,7 +869,8 @@ Follow this workflow:
+ 2. Select only contiguous ranges that already exist in the transcript.
+ 3. Prefer moments with a strong hook, clear payoff, emotional charge, or concrete value.
+ 4. For each chosen segment, use the earliest timestamp in the selected range as start_time and the latest timestamp in the selected range as end_time.
+-5. start_time must be the first word of a self-contained sentence: never a mid-thought fragment, a filler, a bare agreement, or a reference to something this clip does not contain. end_time must finish that thought's last sentence and must not include the next thought's opening words.
++5. start_time must be the first word of a self-contained sentence: never a mid-thought fragment, a filler, a bare agreement, or a reference to something this clip does not contain. The first spoken seconds must give the viewer a reason to stay even without the on-screen title.
++6. end_time must finish the payoff's last sentence. Leave out the start of the next thought, including a clipped syllable or reaction after the payoff. Prefer a segment with a clean ending over one that scores slightly higher but trails off.
+ 
+ Selection target:
+ - Choose {segment_target} segments total.
+diff --git a/backend/src/services/video_service.py b/backend/src/services/video_service.py
+index 9038def..56bf357 100644
+--- a/backend/src/services/video_service.py
++++ b/backend/src/services/video_service.py
+@@ -66,7 +66,7 @@ from ..clip_source_map import (
+     save_clip_source_ranges,
+ )
+ from ..ai import get_most_relevant_parts_by_transcript, max_final_clips_for_duration
+-from ..clip_openings import OPENING_HOOK_PENALTY, opening_text_issue, review_opening
++from ..clip_openings import OPENING_HOOK_PENALTY, ends_sentence, opening_text_issue, review_opening
+ from ..clip_duration import clip_duration
+ from ..config import get_config
+ from ..workflows.contracts import PlanCache, PlanContext, WorkflowResult, WorkflowSpec
+@@ -306,6 +306,51 @@ class VideoService:
+             )
+         return segments
+ 
++    @staticmethod
++    def _refine_segment_endings(
++        segments: List[Dict[str, Any]],
++        transcript_data: Optional[Dict[str, Any]],
++        clip_length: str = "auto",
++    ) -> List[Dict[str, Any]]:
++        """End on a completed thought and leave a short natural audio tail."""
++        if not transcript_data or not transcript_data.get("words"):
++            return segments
++
++        minimum = clip_duration(clip_length).minimum
++        for segment in segments:
++            if segment.get("ending_reviewed") or segment.get("source_ranges"):
++                continue
++            segment["ending_reviewed"] = True
++            start = parse_timestamp_to_seconds(str(segment.get("start_time") or ""))
++            end = parse_timestamp_to_seconds(str(segment.get("end_time") or ""))
++            words = VideoService._segment_words(transcript_data, start, end + 1)
++            if not words:
++                continue
++            # A sentence-ending word close to the proposed cut is a safer
++            # boundary than the model's integer-second timestamp.
++            candidates = [
++                word for word in words
++                if ends_sentence(word["text"])
++                and end - 4 <= word["end"] <= end
++                and word["end"] - start >= minimum
++            ]
++            if candidates:
++                last = candidates[-1]
++                following = next(
++                    (word for word in words if word["start"] >= last["end"] and word is not last),
++                    None,
++                )
++                tail = min(last["end"] + 0.3, end)
++                if following:
++                    tail = min(tail, following["start"] - 0.05)
++                if tail > last["end"]:
++                    segment["end_time"] = f"{tail:.2f}"
++                    segment["text"] = VideoService._ground_segment_text(segment, transcript_data)
++                continue
++            # A clip with no completed sentence at its end should lose rank.
++            segment["virality_score"] = max(0, int(segment.get("virality_score") or 0) - 8)
++        return sorted(segments, key=lambda segment: int(segment.get("virality_score") or 0), reverse=True)
++
+     @staticmethod
+     def _drop_static_segments(
+         video_path: Path, segments: List[Dict[str, Any]]
+@@ -1285,6 +1330,9 @@ class VideoService:
+                 segments_json = VideoService._refine_segment_openings(
+                     segments_json, transcript_data, clip_length
+                 )
++                segments_json = VideoService._refine_segment_endings(
++                    segments_json, transcript_data, clip_length
++                )
+         except Exception:
+             # A heuristic must never fail the task; keep the AI's openings.
+             logger.exception("Opening review failed; keeping the selected openings")
+diff --git a/backend/tests/unit/test_clip_openings.py b/backend/tests/unit/test_clip_openings.py
+index d1f9172..1120a31 100644
+--- a/backend/tests/unit/test_clip_openings.py
++++ b/backend/tests/unit/test_clip_openings.py
+@@ -185,3 +185,18 @@ def test_refine_without_word_timings_penalises_from_text():
+     VideoService._refine_segment_openings([segment], None, "auto")
+     assert segment["virality_score"] == 77 - OPENING_HOOK_PENALTY
+     assert segment["start_time"] == "01:09"
++
++
++def test_refine_ending_excludes_next_word_and_keeps_payoff():
++    transcript = {"words": [
++        {"text": "Listen", "start": 10000, "end": 10500},
++        {"text": "finished.", "start": 39000, "end": 39500},
++        {"text": "So", "start": 39800, "end": 40300},
++    ]}
++    segment = {"start_time": "10", "end_time": "40", "text": "Listen finished. So", "virality_score": 80}
++
++    result = VideoService._refine_segment_endings([segment], transcript)[0]
++
++    assert result["end_time"] == "39.75"
++    assert result["text"] == "Listen finished."
++    assert result["virality_score"] == 80
+-- 
+2.52.0
+
